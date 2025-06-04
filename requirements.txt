@@ -1,0 +1,7 @@
+pandas
+numpy
+yfinance
+scikit-learn
+timesfm[torch]
+jax
+jaxlib
