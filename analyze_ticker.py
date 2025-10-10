@@ -1,6 +1,5 @@
 # analyze_ticker.py
-import os
-import json
+import os, json
 import pandas as pd
 from datetime import datetime
 from config import *
@@ -15,44 +14,52 @@ def ensure_dir(path: str):
     if not os.path.exists(path):
         os.makedirs(path)
 
+def default_serializer(o):
+    if isinstance(o, (pd.Timestamp, )):
+        return o.strftime("%Y-%m-%d")
+    raise TypeError(f"Object of type {o.__class__.__name__} is not JSON serializable")
+
 def analyze(ticker_alias: str, yf_symbol: str):
     ensure_dir(REPORT_DIR)
 
-    # 1) 价格
+    # 1) 行情
     price_csv = os.path.join(REPORT_DIR, f"{ticker_alias}_price.csv")
     price_df = fetch_price_to_csv(yf_symbol, PRICE_START_DATE, PRICE_END_DATE, price_csv)
-    price_df["Close"] = pd.to_numeric(price_df["Close"], errors="coerce") 
+    price_df["Close"] = pd.to_numeric(price_df["Close"], errors="coerce")
     price_df = price_df.dropna(subset=["Close"])
 
-    # 2) 舆情
+    # 2) 舆情（失败也不致命）
     senti_csv = os.path.join(REPORT_DIR, f"{ticker_alias}_sentiment.csv")
-    senti_df = build_sentiment_index_csv(KEYWORDS, senti_csv)
+    senti_df = build_sentiment_index_csv(senti_csv)
 
     # 3) 技术面
     tech_s = technical_score(price_df)
 
     # 4) TimesFM 预测
-    tfm_df = predict_timesfm_next(price_df[["ds","Close"]], horizon=FORECAST_HORIZON)
+    tfm_df = predict_timesfm_next(price_df[["ds", "Close"]], horizon=FORECAST_HORIZON)
 
-    # 5) 融合与建议
+    # 5) 融合
     metrics = combine_signals(price_df, tfm_df, senti_df, tech_s)
     rec = make_recommendation(metrics)
 
     report = {
         "ticker": ticker_alias,
         "yf_symbol": yf_symbol,
-        "as_of": datetime.now().isoformat(timespec="seconds"),
-        "metrics": metrics,
+        "as_of": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "metrics": {k: (float(v) if isinstance(v, (int, float)) else v) for k, v in metrics.items()},
         "recommendation": rec,
-        "peek_forecast": tfm_df.tail(FORECAST_HORIZON).to_dict(orient="records")
+        "peek_forecast": [
+            {"ds": str(r["ds"].date()) if isinstance(r["ds"], (pd.Timestamp,)) else r["ds"], "timesfm": float(r["timesfm"])}
+            for r in tfm_df.tail(FORECAST_HORIZON).to_dict(orient="records")
+        ],
     }
 
-    # 保存
+    # 6) 保存 JSON
     report_json = os.path.join(REPORT_DIR, f"{ticker_alias}_report.json")
     with open(report_json, "w", encoding="utf-8") as f:
-        json.dump(report, f, ensure_ascii=False, indent=2)
+        json.dump(report, f, ensure_ascii=False, indent=2, default=default_serializer)
 
-    # 控制台友好输出
+    # 7) 控制台输出
     print(f"\n=== {ticker_alias} 投资建议（{report['as_of']}）===")
     print(f"TimesFM 预期均值收益率: {metrics['exp_return']:.2%}")
     print(f"综合信号分（-1~+1）: {metrics['combo_score']:.3f}")
@@ -62,7 +69,8 @@ def analyze(ticker_alias: str, yf_symbol: str):
     print(f"报告JSON：{report_json}\n")
 
 if __name__ == "__main__":
-    # 示例1：工商银行 A 股
+    # 示例：工商银行 A 股（A股走 akshare）
     analyze("ICBC_A", YF_SYMBOLS["ICBC_A"])
-    # 示例2：工商银行 H 股（如需要）
+
+    # 如需同时生成港股报告，取消下一行注释（港股走 yfinance）
     # analyze("ICBC_H", YF_SYMBOLS["ICBC_H"])

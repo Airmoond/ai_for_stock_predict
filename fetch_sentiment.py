@@ -1,17 +1,17 @@
 # fetch_sentiment.py
-import re
 import math
-import time
-import pandas as pd
+import re
 import requests
+import pandas as pd
 from datetime import datetime
 from collections import defaultdict
 from snownlp import SnowNLP
+from config import ALPHA_SENTIMENT_MEAN, BETA_NEWS_VOLUME_LOG, KEYWORDS
 
-# 你可以先用几个公开RSS/简单新闻源（示例用必应新闻RSS占位，建议换成你学校/实验允许的源）
+# 简单 RSS 源（占位，能跑；后续可换成更稳定的数据源）
 RSS_SOURCES = [
-    # 你可以放入若干财经RSS，或你已有的抓取接口
-    "https://news.google.com/rss/search?q=%E5%B7%A5%E5%95%86%E9%93%B6%E8%A1%8C%20OR%20%E5%B7%A5%E8%A1%8C%20ICBC&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
+    "https://news.google.com/rss/search?q=%E5%B7%A5%E5%95%86%E9%93%B6%E8%A1%8C%20OR%20%E5%B7%A5%E8%A1%8C%20ICBC&hl=zh-CN&gl=CN&ceid=CN:zh-Hans",
+    "https://news.google.com/rss/search?q=Industrial%20and%20Commercial%20Bank%20of%20China&hl=en-US&gl=US&ceid=US:en",
 ]
 
 def _clean_text(t: str) -> str:
@@ -19,40 +19,35 @@ def _clean_text(t: str) -> str:
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
-def fetch_news_items(keywords: list[str], max_items: int = 200) -> list[dict]:
+def fetch_news_items(max_items: int = 300) -> list[dict]:
+    headers = {"User-Agent": "Mozilla/5.0"}
     items = []
     for url in RSS_SOURCES:
         try:
-            r = requests.get(url, timeout=10)
+            r = requests.get(url, headers=headers, timeout=10)
             if r.status_code != 200:
                 continue
-            # 非严格RSS解析的简单提取：真实项目用 feedparser
             entries = re.findall(r"<item>(.*?)</item>", r.text, re.S)
             for e in entries:
-                title = _clean_text(re.search(r"<title>(.*?)</title>", e, re.S).group(1))
-                pubDate_m = re.search(r"<pubDate>(.*?)</pubDate>", e)
-                pubDate = _clean_text(pubDate_m.group(1)) if pubDate_m else ""
-                link_m = re.search(r"<link>(.*?)</link>", e)
-                link = _clean_text(link_m.group(1)) if link_m else ""
-                if any(k in title for k in keywords):
-                    items.append({"title": title, "pubDate": pubDate, "link": link})
+                title_m = re.search(r"<title>(.*?)</title>", e, re.S)
+                title = _clean_text(title_m.group(1)) if title_m else ""
+                date_m = re.search(r"<pubDate>(.*?)</pubDate>", e)
+                pubDate = _clean_text(date_m.group(1)) if date_m else ""
+                if any(k in title for k in KEYWORDS):
+                    items.append({"title": title, "pubDate": pubDate})
         except Exception:
             continue
     return items[:max_items]
 
 def score_sentiment_zh(text: str) -> float:
-    """
-    SnowNLP 情感分 ∈ (0,1)，>0.5 正面
-    """
     try:
-        return float(SnowNLP(text).sentiments)
+        return float(SnowNLP(text).sentiments)  # (0,1)
     except Exception:
         return 0.5
 
 def daily_sentiment_aggregate(news: list[dict]) -> pd.DataFrame:
     by_day = defaultdict(list)
     for it in news:
-        # 将pubDate解析为日期
         try:
             d = pd.to_datetime(it["pubDate"]).date()
         except Exception:
@@ -66,14 +61,20 @@ def daily_sentiment_aggregate(news: list[dict]) -> pd.DataFrame:
             continue
         mean_score = sum(scores) / len(scores)
         volume = len(scores)
-        # 舆情指数：均值 + 量（对数）
-        senti_index = 0.7 * mean_score + 0.3 * math.log(volume + 1)
+        senti_index = (ALPHA_SENTIMENT_MEAN * mean_score) + (BETA_NEWS_VOLUME_LOG * math.log(volume + 1))
         rows.append({"ds": pd.to_datetime(d), "sentiment_mean": mean_score, "volume": volume, "sentiment_index": senti_index})
+
+    if not rows:
+        return pd.DataFrame(columns=["ds", "sentiment_mean", "volume", "sentiment_index"])
+
     df = pd.DataFrame(rows).sort_values("ds").reset_index(drop=True)
     return df
 
-def build_sentiment_index_csv(keywords: list[str], save_path: str) -> pd.DataFrame:
-    news = fetch_news_items(keywords)
-    df = daily_sentiment_aggregate(news)
+def build_sentiment_index_csv(save_path: str) -> pd.DataFrame:
+    try:
+        news = fetch_news_items()
+        df = daily_sentiment_aggregate(news)
+    except Exception:
+        df = pd.DataFrame(columns=["ds", "sentiment_mean", "volume", "sentiment_index"])
     df.to_csv(save_path, index=False, encoding="utf-8-sig")
     return df
