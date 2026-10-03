@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#ad2333">
+  <title>工银察势——从市场舆情到持仓解读的智能陪伴助手</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <aside class="sidebar">
+    <a class="brand" href="/" aria-label="工银察势首页"><span class="brand-mark">势</span><span>工银察势</span></a>
+    <nav aria-label="主导航">
+      <button class="nav-item active" data-view="overview"><span class="nav-icon" data-icon="grid"></span>研究总览<span class="nav-arrow">↗</span></button>
+      <button class="nav-item" data-view="market"><span class="nav-icon" data-icon="chart"></span>行情与预测</button>
+      <button class="nav-item" data-view="sentiment"><span class="nav-icon" data-icon="news"></span>舆情分析</button>
+      <button class="nav-item" data-view="backtest"><span class="nav-icon" data-icon="layers"></span>回测评估</button>
+    </nav>
+    <div class="watchlist"><div class="sidebar-label">关注标的</div>
+      <button class="stock-item selected" data-ticker="ICBC_A"><span class="stock-symbol">工</span><span>工商银行 A 股<small>601398 · 上交所</small></span><span class="stock-dot"></span></button>
+      <button class="stock-item" data-ticker="ICBC_H"><span class="stock-symbol">工</span><span>工商银行 H 股<small>01398 · 港交所</small></span></button>
+    </div>
+    <div class="sidebar-bottom">智能陪伴 · 理性研究</div>
+  </aside>
+  <div class="app-shell">
+    <header class="topbar"><div class="breadcrumb">研究工作台 <span>/</span> <strong id="breadcrumb-view">研究总览</strong></div><div class="topbar-right"><span id="today"></span></div></header>
+    <main id="main">
+      <section class="page-heading"><div><h1 id="page-title">工银察势</h1><p id="page-subtitle">从市场舆情到持仓解读的智能陪伴助手</p></div><button class="button primary" id="open-analysis"><span data-icon="spark"></span>运行分析</button></section>
+      <section class="stock-heading"><div class="stock-title"><span class="stock-logo">工</span><div><div class="stock-name"><h2>工商银行</h2><select id="ticker-select" class="badge muted" aria-label="选择股票市场"><option value="ICBC_A">A 股</option><option value="ICBC_H">H 股</option></select></div><p id="stock-meta">601398 · 上交所</p></div></div><div class="report-tools"><select id="report-select" aria-label="选择分析报告"><option>正在读取报告…</option></select><button id="download-report" class="icon-button" aria-label="下载当前报告" title="下载当前报告"><span data-icon="download"></span></button></div></section>
+      <div id="data-banner" class="data-banner" role="status"><span data-icon="clock"></span><span>正在读取本地研究数据…</span></div>
+      <div id="job-status" class="job-status" role="status" hidden></div>
+      <div id="content" aria-live="polite"><div class="loading-state"><div class="spinner"></div><p>正在整理研究数据…</p></div></div>
+      <footer>工银察势 · 智能陪伴</footer>
+    </main>
+  </div>
+  <dialog id="analysis-dialog" aria-labelledby="dialog-title"><form id="analysis-form"><div class="dialog-heading"><h2 id="dialog-title">开始分析</h2><button type="button" class="icon-button" id="close-dialog" aria-label="关闭">×</button></div><label for="analysis-model">分析模型</label><select id="analysis-model" name="model"><option value="naive">收盘价基准（非 AI）</option><option value="timesfm">TimesFM · AI 预测</option></select><p class="field-hint" id="model-hint">以最后收盘价作为未来价格的比较基准。</p><label for="analysis-mode">数据来源</label><select id="analysis-mode" name="mode"><option value="offline">本地数据</option><option value="live">联网更新</option></select><label for="analysis-horizon">预测交易日数</label><input id="analysis-horizon" name="horizon" type="number" min="1" max="10" value="3" required><div id="form-error" class="form-error" role="alert" hidden></div><div class="dialog-actions"><button type="button" class="button secondary" id="cancel-dialog">取消</button><button type="submit" class="button primary" id="submit-analysis">开始分析</button></div></form></dialog>
+  <div id="toast" class="toast" role="status" hidden></div>
+  <noscript><p class="noscript">此研究看板需要启用浏览器 JavaScript。</p></noscript>
+</body>
+</html>

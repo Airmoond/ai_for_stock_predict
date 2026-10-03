@@ -1,0 +1,9 @@
+.venv/
+.venv-timesfm/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.tmp
+reports/validation/
+reports/backtests/
+reports/web/

@@ -1,80 +1,156 @@
-# fetch_sentiment.py
+"""Language-aware RSS sentiment with signed volume weighting and safe cache reuse."""
+import html
+import logging
 import math
 import re
-import requests
+import xml.etree.ElementTree as ET
+from functools import lru_cache
+from pathlib import Path
+import numpy as np
 import pandas as pd
-from datetime import datetime
-from collections import defaultdict
-from snownlp import SnowNLP
-from config import ALPHA_SENTIMENT_MEAN, BETA_NEWS_VOLUME_LOG, KEYWORDS
+import requests
+from config import (ALPHA_SENTIMENT_MEAN, BETA_NEWS_VOLUME_LOG, KEYWORDS,
+                    SENTIMENT_LOOKBACK_DAYS)
+from storage import write_csv
 
-# 简单 RSS 源（占位，能跑；后续可换成更稳定的数据源）
+log = logging.getLogger(__name__)
 RSS_SOURCES = [
-    "https://news.google.com/rss/search?q=%E5%B7%A5%E5%95%86%E9%93%B6%E8%A1%8C%20OR%20%E5%B7%A5%E8%A1%8C%20ICBC&hl=zh-CN&gl=CN&ceid=CN:zh-Hans",
+    "https://news.google.com/rss/search?q=工商银行%20OR%20工行%20OR%20ICBC&hl=zh-CN&gl=CN&ceid=CN:zh-Hans",
     "https://news.google.com/rss/search?q=Industrial%20and%20Commercial%20Bank%20of%20China&hl=en-US&gl=US&ceid=US:en",
 ]
+COLUMNS = ["ds", "sentiment_mean", "volume", "sentiment_index", "schema_version"]
 
-def _clean_text(t: str) -> str:
-    t = re.sub(r"<.*?>", "", t)
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
 
-def fetch_news_items(max_items: int = 300) -> list[dict]:
-    headers = {"User-Agent": "Mozilla/5.0"}
-    items = []
+def _clean_text(text):
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", html.unescape(text or ""))).strip()
+
+
+def fetch_news_items(max_items=300):
+    items, failures, successful = [], [], 0
     for url in RSS_SOURCES:
         try:
-            r = requests.get(url, headers=headers, timeout=10)
-            if r.status_code != 200:
-                continue
-            entries = re.findall(r"<item>(.*?)</item>", r.text, re.S)
-            for e in entries:
-                title_m = re.search(r"<title>(.*?)</title>", e, re.S)
-                title = _clean_text(title_m.group(1)) if title_m else ""
-                date_m = re.search(r"<pubDate>(.*?)</pubDate>", e)
-                pubDate = _clean_text(date_m.group(1)) if date_m else ""
-                if any(k in title for k in KEYWORDS):
-                    items.append({"title": title, "pubDate": pubDate})
-        except Exception:
-            continue
-    return items[:max_items]
-
-def score_sentiment_zh(text: str) -> float:
-    try:
-        return float(SnowNLP(text).sentiments)  # (0,1)
-    except Exception:
-        return 0.5
-
-def daily_sentiment_aggregate(news: list[dict]) -> pd.DataFrame:
-    by_day = defaultdict(list)
-    for it in news:
+            response = requests.get(url, headers={"User-Agent": "ICBCResearch/2.0"}, timeout=15)
+            response.raise_for_status()
+            root = ET.fromstring(response.content)
+            successful += 1
+            for entry in root.findall(".//item"):
+                title = _clean_text(entry.findtext("title"))
+                if any(keyword.casefold() in title.casefold() for keyword in KEYWORDS):
+                    items.append({"title": title, "description": _clean_text(entry.findtext("description")),
+                                  "pubDate": entry.findtext("pubDate"), "link": entry.findtext("link")})
+        except (requests.RequestException, ET.ParseError) as exc:
+            failures.append(str(exc))
+            log.warning("新闻源获取失败: %s", exc)
+    if successful == 0:
+        raise RuntimeError("所有新闻源获取失败: " + "; ".join(failures))
+    # Newest first, without inventing a date for malformed RSS entries.
+    def published(item):
         try:
-            d = pd.to_datetime(it["pubDate"]).date()
-        except Exception:
-            d = datetime.utcnow().date()
-        by_day[d].append(it)
+            return pd.to_datetime(item["pubDate"], utc=True).timestamp()
+        except (TypeError, ValueError):
+            return float("-inf")
+    return sorted(items, key=published, reverse=True)[:max_items]
 
-    rows = []
-    for d, items in by_day.items():
-        scores = [score_sentiment_zh(i["title"]) for i in items if i.get("title")]
-        if not scores:
+
+def score_sentiment_zh(text):
+    from snownlp import SnowNLP
+    return float(SnowNLP(text).sentiments)
+
+
+@lru_cache(maxsize=1)
+def _english_analyzer():
+    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+    return SentimentIntensityAnalyzer()
+
+
+def score_sentiment(text):
+    if re.search(r"[\u4e00-\u9fff]", text):
+        return score_sentiment_zh(text)
+    return (_english_analyzer().polarity_scores(text)["compound"] + 1) / 2
+
+
+def sentiment_index(mean, volume):
+    # News count amplifies the sign instead of turning negative coverage positive.
+    amplitude = ALPHA_SENTIMENT_MEAN + BETA_NEWS_VOLUME_LOG * min(math.log1p(volume) / math.log(301), 1)
+    return float(np.clip((2 * mean - 1) * amplitude, -1, 1))
+
+
+def normalize_sentiment(df):
+    if df.empty:
+        return pd.DataFrame(columns=COLUMNS)
+    if not {"ds", "sentiment_mean", "volume"}.issubset(df.columns):
+        raise ValueError("舆情缓存缺少原始均分或新闻数量，无法转换旧版指数")
+    df = df.copy()
+    df["ds"] = pd.to_datetime(df["ds"], errors="coerce").dt.tz_localize(None).dt.normalize()
+    for col in ("sentiment_mean", "volume"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["ds", "sentiment_mean", "volume"])
+    df = df[np.isfinite(df.sentiment_mean) & np.isfinite(df.volume)
+            & df.sentiment_mean.between(0, 1) & (df.volume > 0)]
+    df["sentiment_index"] = [sentiment_index(m, v) for m, v in zip(df.sentiment_mean, df.volume)]
+    df["schema_version"] = 2
+    return df[COLUMNS].sort_values("ds").drop_duplicates("ds", keep="last").reset_index(drop=True)
+
+
+def daily_sentiment_aggregate(news, *, as_of=None, lookback_days=SENTIMENT_LOOKBACK_DAYS):
+    as_of = pd.Timestamp(as_of).normalize() if as_of is not None else pd.Timestamp.now(tz="Asia/Shanghai").tz_localize(None).normalize()
+    by_day, seen, errors = {}, set(), []
+    for item in news:
+        title = _clean_text(item.get("title"))
+        if not title:
             continue
-        mean_score = sum(scores) / len(scores)
-        volume = len(scores)
-        senti_index = (ALPHA_SENTIMENT_MEAN * mean_score) + (BETA_NEWS_VOLUME_LOG * math.log(volume + 1))
-        rows.append({"ds": pd.to_datetime(d), "sentiment_mean": mean_score, "volume": volume, "sentiment_index": senti_index})
-
-    if not rows:
-        return pd.DataFrame(columns=["ds", "sentiment_mean", "volume", "sentiment_index"])
-
-    df = pd.DataFrame(rows).sort_values("ds").reset_index(drop=True)
+        try:
+            published = pd.to_datetime(item.get("pubDate"), utc=True)
+            if pd.isna(published):
+                raise ValueError("新闻缺少发布日期")
+            day = published.tz_convert("Asia/Shanghai").tz_localize(None).normalize()
+            if day > as_of or day < as_of - pd.Timedelta(days=lookback_days - 1):
+                continue
+            key = (day, title.casefold())
+            if key in seen:
+                continue
+            seen.add(key)
+            description = _clean_text(item.get("description"))
+            text = title if not description or description.startswith(title) else title + ". " + description
+            score = score_sentiment(text)
+            if not np.isfinite(score) or not 0 <= score <= 1:
+                raise ValueError("情绪分不在有效范围内")
+            by_day.setdefault(day, []).append(score)
+        except (ValueError, TypeError, ImportError) as exc:
+            errors.append(f"跳过新闻 {title[:40]}: {exc}")
+    rows = [{"ds": day, "sentiment_mean": float(np.mean(scores)), "volume": len(scores)}
+            for day, scores in by_day.items()]
+    df = normalize_sentiment(pd.DataFrame(rows))
+    df.attrs["warnings"] = errors
     return df
 
-def build_sentiment_index_csv(save_path: str) -> pd.DataFrame:
-    try:
-        news = fetch_news_items()
-        df = daily_sentiment_aggregate(news)
-    except Exception:
-        df = pd.DataFrame(columns=["ds", "sentiment_mean", "volume", "sentiment_index"])
-    df.to_csv(save_path, index=False, encoding="utf-8-sig")
+
+def build_sentiment_index_csv(save_path, *, as_of=None, offline=False):
+    path = Path(save_path)
+    warnings = []
+    cached = pd.DataFrame(columns=COLUMNS)
+    if path.exists():
+        try:
+            cached = normalize_sentiment(pd.read_csv(path))
+        except (ValueError, pd.errors.ParserError) as exc:
+            warnings.append(f"舆情缓存不可用: {exc}")
+    df = cached
+    source = "cache"
+    if not offline:
+        try:
+            fresh = daily_sentiment_aggregate(fetch_news_items(), as_of=as_of)
+            warnings.extend(fresh.attrs.get("warnings", []))
+            if not fresh.empty:
+                df = normalize_sentiment(fresh if cached.empty else pd.concat([cached, fresh], ignore_index=True))
+                write_csv(df, path)
+                source = "rss"
+            else:
+                warnings.append("没有有效近期新闻，保留已有舆情缓存")
+        except Exception as exc:
+            warnings.append(f"舆情更新失败，保留已有缓存: {exc}")
+            log.warning(warnings[-1])
+    if as_of is not None:
+        cutoff = pd.Timestamp(as_of).normalize()
+        df = df[(df.ds <= cutoff) & (df.ds >= cutoff - pd.Timedelta(days=SENTIMENT_LOOKBACK_DAYS - 1))].copy()
+    df.attrs["quality"] = {"source": source, "warnings": warnings}
     return df

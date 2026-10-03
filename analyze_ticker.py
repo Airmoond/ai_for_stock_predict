@@ -1,76 +1,91 @@
-# analyze_ticker.py
-import os, json
+"""Command-line analysis with reproducible dates, model labels and data quality."""
+import argparse
+import logging
+from pathlib import Path
 import pandas as pd
-from datetime import datetime
-from config import *
+from config import (YF_SYMBOLS, REPORT_DIR, PRICE_START_DATE, PRICE_END_DATE,
+                    FORECAST_HORIZON, W_TIMESFM, W_SENTI, W_TECH, TIMESFM_CHECKPOINT)
 from fetch_price import fetch_price_to_csv
 from fetch_sentiment import build_sentiment_index_csv
-from indicators import technical_score
-from timesfm_model import predict_timesfm_next
+from indicators import technical_score, technical_snapshot
+from timesfm_model import predict_next
 from ensemble import combine_signals
 from recommend import make_recommendation
+from storage import write_json
 
-def ensure_dir(path: str):
-    if not os.path.exists(path):
-        os.makedirs(path)
 
-def default_serializer(o):
-    if isinstance(o, (pd.Timestamp, )):
-        return o.strftime("%Y-%m-%d")
-    raise TypeError(f"Object of type {o.__class__.__name__} is not JSON serializable")
-
-def analyze(ticker_alias: str, yf_symbol: str):
-    ensure_dir(REPORT_DIR)
-
-    # 1) 行情
-    price_csv = os.path.join(REPORT_DIR, f"{ticker_alias}_price.csv")
-    price_df = fetch_price_to_csv(yf_symbol, PRICE_START_DATE, PRICE_END_DATE, price_csv)
-    price_df["Close"] = pd.to_numeric(price_df["Close"], errors="coerce")
-    price_df = price_df.dropna(subset=["Close"])
-
-    # 2) 舆情（失败也不致命）
-    senti_csv = os.path.join(REPORT_DIR, f"{ticker_alias}_sentiment.csv")
-    senti_df = build_sentiment_index_csv(senti_csv)
-
-    # 3) 技术面
-    tech_s = technical_score(price_df)
-
-    # 4) TimesFM 预测
-    tfm_df = predict_timesfm_next(price_df[["ds", "Close"]], horizon=FORECAST_HORIZON)
-
-    # 5) 融合
-    metrics = combine_signals(price_df, tfm_df, senti_df, tech_s)
-    rec = make_recommendation(metrics)
-
+def analyze(ticker_alias, yf_symbol, *, start=PRICE_START_DATE, end=PRICE_END_DATE,
+            horizon=FORECAST_HORIZON, offline=False, force_refresh=False,
+            strict_data=False, model="timesfm", backend="cpu", output_dir=REPORT_DIR,
+            cache_dir=None):
+    if offline and force_refresh:
+        raise ValueError("离线模式不能强制联网刷新")
+    output_dir = Path(output_dir)
+    cache_dir = Path(cache_dir) if cache_dir is not None else output_dir
+    price_df = fetch_price_to_csv(yf_symbol, start, end, cache_dir / f"{ticker_alias}_price.csv",
+                                 offline=offline, force_refresh=force_refresh, allow_stale=not strict_data)
+    quality = dict(price_df.attrs["quality"])
+    quality["insufficient_history"] = len(price_df) < 30
+    if strict_data and (quality["stale"] or quality["missing_sessions"]):
+        raise ValueError("严格模式拒绝过期或不完整的行情: " + "; ".join(quality["warnings"]))
+    data_as_of = price_df.ds.iloc[-1]
+    senti_df = build_sentiment_index_csv(cache_dir / f"{ticker_alias}_sentiment.csv",
+                                        as_of=data_as_of, offline=offline)
+    forecast_df = predict_next(price_df[["ds", "Close"]], horizon=horizon,
+                               symbol=yf_symbol, model=model, backend=backend)
+    metrics = combine_signals(price_df, forecast_df, senti_df, technical_score(price_df))
+    technical = technical_snapshot(price_df)
+    recommendation = make_recommendation(metrics, technical=technical, data_quality=quality, model=model)
+    warnings = quality["warnings"] + senti_df.attrs.get("quality", {}).get("warnings", [])
+    if not metrics["sentiment_available"]:
+        warnings.append("没有7日内有效舆情，舆情分按0计；未重新分配权重")
     report = {
-        "ticker": ticker_alias,
-        "yf_symbol": yf_symbol,
-        "as_of": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "metrics": {k: (float(v) if isinstance(v, (int, float)) else v) for k, v in metrics.items()},
-        "recommendation": rec,
-        "peek_forecast": [
-            {"ds": str(r["ds"].date()) if isinstance(r["ds"], (pd.Timestamp,)) else r["ds"], "timesfm": float(r["timesfm"])}
-            for r in tfm_df.tail(FORECAST_HORIZON).to_dict(orient="records")
-        ],
+        "schema_version": 2, "ticker": ticker_alias, "yf_symbol": yf_symbol,
+        "as_of": pd.Timestamp.now(tz="Asia/Shanghai").isoformat(),
+        "data_as_of": str(data_as_of.date()), "requested_range": {"start": start, "end": end},
+        "model": {"name": model, "checkpoint": TIMESFM_CHECKPOINT if model == "timesfm" else None,
+                  "horizon_sessions": horizon, "context_observations": min(len(price_df), 512)},
+        "data_quality": quality, "warnings": warnings,
+        "weights": {"forecast": W_TIMESFM, "sentiment": W_SENTI, "technical": W_TECH},
+        "metrics": metrics, "technical": technical, "recommendation": recommendation,
+        "forecast": [{"ds": str(row.ds.date()), "price": float(row.timesfm)}
+                     for row in forecast_df.itertuples(index=False)],
     }
+    suffix = "" if model == "timesfm" else f"_{model}"
+    path = output_dir / f"{ticker_alias}{suffix}_report.json"
+    write_json(report, path)
+    print(f"\n{ticker_alias} 分析｜行情截至 {report['data_as_of']}｜模型 {model}")
+    print(f"评级：{recommendation['rating']}\n{recommendation['note']}")
+    for warning in warnings:
+        print(f"提示：{warning}")
+    print(f"报告：{path}")
+    return report
 
-    # 6) 保存 JSON
-    report_json = os.path.join(REPORT_DIR, f"{ticker_alias}_report.json")
-    with open(report_json, "w", encoding="utf-8") as f:
-        json.dump(report, f, ensure_ascii=False, indent=2, default=default_serializer)
 
-    # 7) 控制台输出
-    print(f"\n=== {ticker_alias} 投资建议（{report['as_of']}）===")
-    print(f"TimesFM 预期均值收益率: {metrics['exp_return']:.2%}")
-    print(f"综合信号分（-1~+1）: {metrics['combo_score']:.3f}")
-    print(f"→ 建议：{rec['rating']} | 理由：{rec['note']}")
-    print("风险提示：", "；".join(rec["risks"]))
-    print("触发条件：", "；".join(rec["triggers"]))
-    print(f"报告JSON：{report_json}\n")
+def main():
+    parser = argparse.ArgumentParser(description="工商银行价格、舆情和技术面分析")
+    parser.add_argument("--ticker", choices=YF_SYMBOLS, default="ICBC_A")
+    parser.add_argument("--start", default=PRICE_START_DATE)
+    parser.add_argument("--end", default=PRICE_END_DATE, help="包含结束日，仅使用已收盘行情")
+    parser.add_argument("--horizon", type=int, default=FORECAST_HORIZON)
+    parser.add_argument("--model", choices=["timesfm", "naive"], default="timesfm")
+    parser.add_argument("--backend", choices=["cpu", "gpu"], default="cpu")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--offline", action="store_true")
+    mode.add_argument("--refresh", action="store_true")
+    parser.add_argument("--strict-data", action="store_true")
+    parser.add_argument("--output-dir", type=Path, default=REPORT_DIR)
+    parser.add_argument("--cache-dir", type=Path, help="缓存目录；默认与输出目录相同")
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    try:
+        analyze(args.ticker, YF_SYMBOLS[args.ticker], start=args.start, end=args.end,
+                horizon=args.horizon, offline=args.offline, force_refresh=args.refresh,
+                strict_data=args.strict_data, model=args.model, backend=args.backend,
+                output_dir=args.output_dir, cache_dir=args.cache_dir)
+    except (RuntimeError, ValueError, OSError) as exc:
+        parser.exit(1, f"分析失败：{exc}\n")
+
 
 if __name__ == "__main__":
-    # 示例：工商银行 A 股（A股走 akshare）
-    analyze("ICBC_A", YF_SYMBOLS["ICBC_A"])
-
-    # 如需同时生成港股报告，取消下一行注释（港股走 yfinance）
-    # analyze("ICBC_H", YF_SYMBOLS["ICBC_H"])
+    main()
